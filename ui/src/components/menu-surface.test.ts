@@ -1,0 +1,109 @@
+/* @vitest-environment jsdom */
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { subscribeNativeOverlayOcclusion } from "../lib/native-overlay-occlusion.ts";
+import { hasMenuSurface, promoteToPopoverTopLayer } from "./menu-surface.ts";
+
+const bridge = vi.hoisted(() => ({ available: false }));
+vi.mock("../app/native-browser-host.ts", () => ({
+  hasNativeBrowserBridge: () => bridge.available,
+}));
+
+let unsubscribe: (() => void) | undefined;
+afterEach(async () => {
+  document.body.replaceChildren();
+  await Promise.resolve();
+  unsubscribe?.();
+  unsubscribe = undefined;
+  bridge.available = false;
+});
+
+describe("openclaw-menu-surface", () => {
+  it("promotes itself to the top layer on every connect", () => {
+    const surface = document.createElement("openclaw-menu-surface");
+    const showPopover = vi.fn();
+    surface.showPopover = showPopover;
+    document.body.append(surface);
+    expect(surface.getAttribute("popover")).toBe("manual");
+    expect(showPopover).toHaveBeenCalledTimes(1);
+    expect(surface.matches(":popover-open")).toBe(false);
+    expect(hasMenuSurface(document)).toBe(true);
+
+    // Menus toggle by removing/re-adding the surface; each reopen must
+    // re-enter the top layer.
+    surface.remove();
+    expect(hasMenuSurface(document)).toBe(false);
+    document.body.append(surface);
+    expect(showPopover).toHaveBeenCalledTimes(2);
+    expect(hasMenuSurface(document)).toBe(true);
+
+    const otherDocument = document.implementation.createHTMLDocument();
+    otherDocument.body.append(surface);
+    expect(hasMenuSurface(document)).toBe(false);
+    expect(hasMenuSurface(otherDocument)).toBe(true);
+    surface.remove();
+    expect(hasMenuSurface(otherDocument)).toBe(false);
+  });
+});
+
+describe("native overlay occlusion for menus", () => {
+  it("follows the live positioned children of a zero-sized menu host", async () => {
+    bridge.available = true;
+    const changes = vi.fn();
+    unsubscribe = subscribeNativeOverlayOcclusion(changes, () => new DOMRect(0, 0, 100, 100));
+    const surface = document.createElement("openclaw-menu-surface");
+    surface.showPopover = vi.fn();
+    surface.getBoundingClientRect = () => new DOMRect(0, 0, 0, 0);
+    const menu = document.createElement("section");
+    menu.getBoundingClientRect = () => new DOMRect(20, 20, 50, 50);
+    surface.append(menu);
+    document.body.append(surface);
+    await new Promise(requestAnimationFrame);
+    expect(changes.mock.calls).toEqual([[false], [true]]);
+
+    const replacement = document.createElement("section");
+    replacement.getBoundingClientRect = () => new DOMRect(200, 20, 50, 50);
+    surface.replaceChildren(replacement);
+    await new Promise(requestAnimationFrame);
+    expect(changes.mock.calls).toEqual([[false], [true], [false]]);
+
+    replacement.getBoundingClientRect = () => new DOMRect(20, 20, 50, 50);
+    await new Promise(requestAnimationFrame);
+    expect(changes.mock.calls).toEqual([[false], [true], [false], [true]]);
+  });
+
+  it("keeps overlapping surfaces occluded until their close or removal, including shadow roots", async () => {
+    bridge.available = true;
+    const changes = vi.fn();
+    unsubscribe = subscribeNativeOverlayOcclusion(changes, () => new DOMRect(0, 0, 500, 500));
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = host.attachShadow({ mode: "open" });
+    const first = document.createElement("div");
+    const second = document.createElement("div");
+    first.getBoundingClientRect = () => new DOMRect(10, 10, 100, 100);
+    second.getBoundingClientRect = () => new DOMRect(20, 20, 100, 100);
+    root.append(first, second);
+    first.showPopover = vi.fn();
+    promoteToPopoverTopLayer(first, () => [first]);
+    promoteToPopoverTopLayer(first, () => [first]);
+    // Native webviews also cover top-layer menus.
+    promoteToPopoverTopLayer(second, () => [second]);
+    await new Promise(requestAnimationFrame);
+    expect(changes.mock.calls).toEqual([[false], [true]]);
+
+    const closed = new Event("toggle");
+    Object.defineProperty(closed, "newState", { value: "closed" });
+    first.dispatchEvent(closed);
+    expect(changes.mock.calls).toEqual([[false], [true]]);
+    second.remove();
+    await Promise.resolve();
+    expect(changes.mock.calls).toEqual([[false], [true], [false]]);
+
+    promoteToPopoverTopLayer(first, () => [first]);
+    await new Promise(requestAnimationFrame);
+    host.remove();
+    await Promise.resolve();
+    expect(changes.mock.calls).toEqual([[false], [true], [false], [true], [false]]);
+  });
+});
